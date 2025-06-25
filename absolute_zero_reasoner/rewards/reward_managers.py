@@ -1,5 +1,6 @@
 import os
 from functools import partial
+import subprocess
 from typing import Dict, Any, List, Tuple
 from collections import defaultdict
 import re
@@ -32,6 +33,120 @@ from absolute_zero_reasoner.utils.dataset.rl_dataset import RLHFDataset
 from absolute_zero_reasoner.utils.logging_utils.stdout import PrettyPrinter
 from absolute_zero_reasoner.utils.code_utils.checks import check_composite_function, check_no_definitions
 
+import io
+import os
+import sys
+import ast
+import json
+import time
+import argparse
+import numpy as np
+import multiprocessing
+
+def extract_code(full_output):
+    matches = re.findall(r"```python(.*?)```", full_output, re.DOTALL)
+    if matches:
+        code_output = matches[-1].strip()
+    else:
+        code_output = "We can not extract the code in the output. "
+    return code_output
+
+def modify(c):
+    # Remove any occurrences of "plaintext\n"
+    c = c.replace("plaintext\n", "")
+    
+    # Convert literal "\n" to actual newlines
+    c = c.replace("\\n", "\n")
+    
+    # Ensure there's a trailing newline
+    if not c.endswith("\n"):
+        c += "\n"
+    
+    return c
+
+def extract_test_cases(full_output):
+    # First, try extracting with the updated triple-backtick pattern
+    pattern_input_backticks = r'\*\*Test Input:\*\*\s*```(.*?)```'
+    pattern_output_backticks = r'\*\*Test Output:\*\*\s*```(.*?)```'
+    matches_input = re.findall(pattern_input_backticks, full_output, re.DOTALL)
+    matches_output = re.findall(pattern_output_backticks, full_output, re.DOTALL)
+
+    fail_case = [""]
+    # For Test Input: either use the updated triple-backtick version or fallback to plain text
+    if matches_input:
+        test_input = [modify(matches_input[-1].lstrip('\n'))]
+    else:
+        # Fallback pattern without backticks: capture until **Test Output:**
+        pattern_input_plain = r'\*\*Test Input:\*\*\s*([\s\S]*?)(?=\*\*Test Output:\*\*)'
+        matches_input_plain = re.findall(pattern_input_plain, full_output, re.DOTALL)
+        if matches_input_plain:
+            test_input = [modify(matches_input_plain[-1].strip())]
+        else:
+            test_input = fail_case
+    
+    # For Test Output: either use the updated triple-backtick version or fallback to plain text
+    if matches_output:
+        test_output = [modify(matches_output[-1].lstrip('\n'))]
+    else:
+        # Fallback: capture until the **Explanation:** marker or end-of-string
+        pattern_output_plain = r'\*\*Test Output:\*\*\s*([\s\S]*?)(?=\*\*Explanation:|\*\*Test Input:|$)'
+        matches_output_plain = re.findall(pattern_output_plain, full_output, re.DOTALL)
+        if matches_output_plain:
+            test_output = [modify(matches_output_plain[-1].strip())]
+        else:
+            test_output = fail_case
+    
+    # Also extract from the last occurrence of **Test Input:** to the end
+    index = full_output.rfind("**Test Input:**")
+    if index != -1:
+        example_text = [full_output[index:]]
+    else:
+        example_text = fail_case
+    
+    # If any essential piece is missing, return empties
+    if example_text == fail_case or test_input == fail_case or test_output == fail_case:
+        return fail_case, fail_case, fail_case
+    
+    return test_input, test_output, example_text
+
+def str2bool(x):
+    return x.lower() in ("1", "true", "yes")
+
+def normalize_reward(reward_arr):
+    if np.all(reward_arr == 1):
+        return reward_arr
+    mean = np.mean(reward_arr)
+    std = np.std(reward_arr)
+    if std.item() == 0:
+        return None
+    return (reward_arr - mean) / std
+
+def normalize_balance_std(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    pos_mask = x > 0
+    neg_mask = x < 0
+    sum_pos = x[pos_mask].sum()
+    sum_neg_abs = abs(x[neg_mask].sum())
+    if sum_pos * sum_neg_abs == 0:
+        return None
+    scale_factor = sum_neg_abs / sum_pos
+    x[pos_mask] *= scale_factor
+    return x / x.std()
+
+def length_regularize(reward_arr, response_length_list):
+    reward_arr = np.sign(reward_arr)
+    pos_list = np.where(reward_arr == 1)[0].tolist()
+    neg_list = np.where(reward_arr == -1)[0].tolist()
+    pos_response_length = np.array([response_length_list[j] for j in pos_list])
+    threshold = np.median(pos_response_length).item()
+    if np.sum((pos_response_length - threshold)**2) == 0: # no variance
+        return normalize_balance_std(np.sign(reward_arr))
+    threshold = max(min(threshold, 8000), 1000)
+    length_reg_reward = np.zeros(len(reward_arr), float)
+    length_reg_reward[pos_list] = - pos_response_length + threshold
+    length_reg_reward[neg_list] = np.min(length_reg_reward).copy()
+    length_reg_reward = normalize_balance_std(length_reg_reward)
+    return length_reg_reward
 
 class CodeIORewardManager():
     """The reward manager."""
@@ -337,196 +452,148 @@ class CodeIORewardManager():
 
     def __call__(
         self,
-        data: DataProto,
-        problem_type: str = None,
+        data: List[DataProto],
         executor = None,
         rollout_actor_wg = None,
         banned_words: List[str] = [],
         banned_assertion_keywords: List[str] = [],
         n_samples: int = 1,
-        input_type_counters: Dict[str, Dict[str, int]] = None,
-        output_type_counters: Dict[str, Dict[str, int]] = None,
-        error_type_counters: Dict[str, Dict[str, int]] = None,
+        max_ground_truth_test: int = 8,
+        k_code: int = 1,
+        k_case: int = 1,
     ) -> Tuple[torch.Tensor, Dict, List[Dict], List[Dict]]:
         """We will expand this function gradually based on the available datasets"""
 
-        # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if 'rm_scores' in data.batch.keys():
-            return data.batch['rm_scores']
+        code_batch, case_batch, selected_data = data
 
-        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        # preprocess
+        for data in selected_data:
+            data["full_code_generation"] = []
+            data["code_response_length"] = []
+            data["full_case_generation"] = []
+            data["case_response_length"] = []
+            data["generated_code"] = []
+            max_k = min(max_ground_truth_test, len(data["test_input"]))
+            data["num_ground_truth_test"] = max_k
+            data["all_case_input"] = (data["test_input"][:max_k]).copy()
+            data["all_case_output"] = (data["test_output"][:max_k]).copy()
+            data["case_input"] = []
+            data["case_output"] = []
+            data["case_text"] = []
 
-        all_scores = defaultdict(list)
-        data_dicts = []
-        valid_programs = [] # for gen tasks, we need to store the valid programs for later use, ignore this if prediction task
-        correct_predictions = []
-        uids = np.array([str(uuid.uuid4()) for _ in range(len(data))], dtype=object)
-        if problem_type is None:
-            problem_types = [d.non_tensor_batch['extra_info']['metric'] for d in data]
-            problem_type = 'pred' # dummy set
-        else:
-            problem_types = [problem_type] * len(data)
-        PrettyPrinter.section_header("Getting Data Dicts")
-        for i in range(len(data)): # get format score
-            data_dict = self._get_data_dict(data[i], problem_types[i], executor, banned_words, uids[i], banned_assertion_keywords)
-            data_dicts.append(data_dict)
+        # process generated codes
+        for idx, code_b in enumerate(code_batch):
+            code_text = self.tokenizer.decode(code_b.batch['responses'], skip_special_tokens=True)
+            code_output = extract_code(code_text)
+            selected_data[idx//k_code]['full_code_generation'] = selected_data[idx//k_code]['full_code_generation'] + [code_text]
+            selected_data[idx//k_code]['generated_code'] = selected_data[idx//k_code]['generated_code'] + [code_output]
+            selected_data[idx//k_code]['code_response_length'].append(len(self.tokenizer.encode(code_text, add_special_tokens=False)))
 
-        if problem_type.startswith('gen') and rollout_actor_wg is not None: # get generation rewards
-            PrettyPrinter.section_header("Generating Rewards for Generation Tasks")
-            rewards, valid_programs = self._get_problem_generator_rewards_and_valid_programs(
-                data_dicts=data_dicts,
-                problem_type=problem_type,
-                n_samples=n_samples,
-                rollout_actor_wg=rollout_actor_wg,
-                executor=executor,
-                input_type_counters=input_type_counters,
-                output_type_counters=output_type_counters,
-                error_type_counters=error_type_counters,
-            )
-            PrettyPrinter.section_header("Combining Rewards for Generation Tasks")
-            for i in range(len(data_dicts)):
-                uid = data_dicts[i]['uid']
-                valid_response_length = data_dicts[i]['valid_response_length']
-                acc_reward = rewards[uid]['accuracy']
-                format_reward = data_dicts[i]['format_score']
-                if format_reward > 0:
-                    if acc_reward > 0:
-                        # Helper function for safe reward combination
-                        def _combine_rewards(acc, intrinsic_components, method):
-                            components = [c for c in intrinsic_components if c is not None]
+        # process generated unit tests
+        for idx, case_b in enumerate(case_batch):
+            case_text = self.tokenizer.decode(case_b.batch['responses'], skip_special_tokens=True)
+            test_input, test_output, example_text = extract_test_cases(case_text)
+            selected_data[idx // k_case]["full_case_generation"] = selected_data[idx // k_case]["full_case_generation"] + [case_text]
+            selected_data[idx // k_case]["case_input"] = selected_data[idx // k_case]["case_input"] + test_input
+            selected_data[idx // k_case]["case_output"] = selected_data[idx // k_case]["case_output"] + test_output
+            selected_data[idx // k_case]["case_text"] = selected_data[idx // k_case]["case_text"] + example_text
+            selected_data[idx // k_case]["all_case_input"] = selected_data[idx // k_case]["all_case_input"] + test_input
+            selected_data[idx // k_case]["all_case_output"] = selected_data[idx // k_case]["all_case_output"] + test_output
+            selected_data[idx // k_case]["case_response_length"].append(len(self.tokenizer.encode(case_text, add_special_tokens=False)))
 
-                            if method == 'sum':
-                                return acc + sum(components) if components else acc
-                            elif method == 'multiply':
-                                return acc * np.prod([c for c in components]) if components else acc
-                            elif method == 'sum_multiply':
-                                return acc + np.prod([c for c in components]) if components else acc
-                            elif method == 'multiply_sum':
-                                return acc * sum(components) if components else acc
-                            else:
-                                raise ValueError(f"Unknown combination method: {method}")
+        # data = execute_scripts(selected_data, num_chunks=k_code * k_case * len(selected_data))
+        with open("./outputs-execute.json", "w", encoding="utf-8") as f:
+            json.dump(selected_data, f, indent=2, ensure_ascii=False)
 
-                        intrinsic_reward_components = []
-                        if problem_type.endswith('code_f'):
-                            if self.generation_reward_config.f_input_answer_diversity_reward.enabled:
-                                intrinsic_reward_components.append(min(self.generation_reward_config.f_input_answer_diversity_reward.coef * rewards[uid]['input_type_counts'],
-                                    self.generation_reward_config.f_input_answer_diversity_reward.max))
-                            if self.generation_reward_config.f_output_answer_diversity_reward.enabled:
-                                intrinsic_reward_components.append(min(self.generation_reward_config.f_output_answer_diversity_reward.coef * rewards[uid]['output_type_counts'],
-                                    self.generation_reward_config.f_output_answer_diversity_reward.max))
+        subprocess.run(
+            'python /home/aiops/chenxw/Absolute-Zero-Reasoner/absolute_zero_reasoner/rewards/exe.py',
+            shell=True,
+            check=True,
+        )
+
+        with open("./outputs-execute.json", 'r') as f:
+            data = json.load(f)
+
+        code_reward_tensor = torch.zeros_like(code_batch.batch['responses'], dtype=torch.float32)
+        case_reward_tensor = torch.zeros_like(case_batch.batch['responses'], dtype=torch.float32)
+
+        for i in range(len(data)):
+            if data[i]["all_case_bool_table"] is None:
+                continue
+            
+            t = data[i]["num_ground_truth_test"]
+            all_test_table_i = np.array(data[i]["all_case_bool_table"])[:, :t].copy()
+            all_case_table_i = np.array(data[i]["all_case_bool_table"])[:, t:].copy()
+
+            # reward for code
+            code_reward = np.mean(all_test_table_i, 1)
+            #code_reward = all_test_table_i.all(axis=1).astype(float)
+            code_reward = normalize_reward(code_reward)
+            if code_reward is not None:
+                code_reward = length_regularize(code_reward, data[i]["code_response_length"])
+                if code_reward is not None:
+                    code_reward = code_reward.tolist()
+                    for j in range(len(code_reward)):
+                        # code_data_i = {}
+                        # code_data_i["prompt"] = data[i]["code_generation_prompt"]
+                        # code_data_i["reward"] = code_reward[j]
+                        # code_data.append(code_data_i)
+                        prompt_ids = code_batch[i*k_code + j].batch['prompts']
+                        prompt_length = prompt_ids.shape[-1]
+                        valid_response_length = code_batch[i*k_code + j].batch['attention_mask'][prompt_length:].sum()
+                        code_reward_tensor[i*k_code + j, valid_response_length - 1] = code_reward[j]
+            
+            # reward for case
+            correct_code_list = np.where(all_test_table_i.all(axis=1))[0].tolist()
+            if len(correct_code_list) > 0:
+                # get reward sign
+                correct_code_table = all_case_table_i[correct_code_list, :].copy()
+                index_list = np.where(np.all(correct_code_table, axis=0))[0].tolist()
+                reward_sign = -np.ones(correct_code_table.shape[1], dtype=float)
+                reward_sign[index_list] = 1
+                case_reward = reward_sign.copy()
+                # get reward scale
+                wrong_code_list = [j for j in range(all_case_table_i.shape[0]) if j not in correct_code_list]
+                if len(wrong_code_list) > 0:
+                    reward_scale = np.ones(correct_code_table.shape[1], dtype=float)
+                    correct_case_list = np.where(correct_code_table.all(axis=0))[0].tolist()
+                    wrong_case_list = [j for j in range(all_case_table_i.shape[1]) if j not in correct_case_list]
+                    if len(correct_case_list):
+                        wrong_code_correct_case_table = all_case_table_i[wrong_code_list, :][:, correct_case_list].copy()
+                        if True:  # TODO: True by default, but suggest False after 100+ optimization steps
+                            mean_p01 = np.mean(~wrong_code_correct_case_table, 0)
                         else:
-                            if self.generation_reward_config.complexity_reward.enabled:
-                                intrinsic_reward_components.append(min(self.generation_reward_config.complexity_reward.coef * rewards[uid]['complexity'],
-                                    self.generation_reward_config.complexity_reward.max))
-                            if self.generation_reward_config.mean_edit_distance_reward.enabled:
-                                intrinsic_reward_components.append(min(self.generation_reward_config.mean_edit_distance_reward.coef * rewards[uid]['mean_edit_distance'],
-                                    self.generation_reward_config.mean_edit_distance_reward.max))
-                            if self.generation_reward_config.halstead_reward.enabled:
-                                intrinsic_reward_components.append(min(self.generation_reward_config.halstead_reward.coef * rewards[uid]['halstead'],
-                                    self.generation_reward_config.halstead_reward.max))
-                            if self.generation_reward_config.answer_diversity_reward.enabled:
-                                intrinsic_reward_components.append(min(self.generation_reward_config.answer_diversity_reward.coef * rewards[uid]['type_counts'],
-                                    self.generation_reward_config.answer_diversity_reward.max))
-
-                        final_reward = _combine_rewards(acc_reward, intrinsic_reward_components, self.generation_reward_config.intrinsic_combine_method)
-                        reward_tensor[i, valid_response_length - 1] = final_reward
-                    else:
-                        reward_tensor[i, valid_response_length - 1] = -0.5
-                else:
-                    reward_tensor[i, valid_response_length - 1] = -1.0
-            all_scores['accuracy'] = [rewards[uid]['accuracy'] for uid in rewards]
-            all_scores['format_score'] = [data_dicts[i]['format_score'] for i in range(len(data))]
-            if 'code_f' not in problem_type:
-                all_scores['answer_diversity'] = [rewards[uid]['type_counts'] for uid in rewards]
-                all_scores['complexity'] = [rewards[uid]['complexity'] for uid in rewards]
-                all_scores['mean_edit_distance'] = [rewards[uid]['mean_edit_distance'] for uid in rewards]
-                all_scores['halstead'] = [rewards[uid]['halstead'] for uid in rewards]
-            else:
-                all_scores['input_answer_diversity'] = [rewards[uid]['input_type_counts'] for uid in rewards]
-                all_scores['output_answer_diversity'] = [rewards[uid]['output_type_counts'] for uid in rewards]
-        elif problem_type.startswith('pred'): # get prediction rewards
-            PrettyPrinter.section_header("Getting Prediction Rewards")
-            all_scores['none_count'] = 0
-            acc_rewards = []
-            for i, data_dict in enumerate(data_dicts):
-                valid_response_length = data_dict['valid_response_length']
-                imports = data_dict['imports']
-                if not problem_type.endswith('code_f'):
-                    answer = data_dict['answer']
-                    gold_input = data_dict['input']
-                    gold_output = data_dict['output']
-                    program = data_dict['program']
-                else:
-                    hidden_inputs = data_dict['hidden_inputs']
-                    hidden_outputs = data_dict['hidden_outputs']
-                if not data_dicts[i]['format_score']: # early stop if the format is not correct
-                    acc_reward = 0.
-                elif problem_types[i].endswith('code_i'):
-                    acc_reward = executor.eval_input_prediction(code=program, gold_output=gold_output, agent_input=answer, imports=list(set(imports)))
-                    # problematic, but we did not encounter too much of this
-                    if acc_reward is None:
-                        all_scores['none_count'] += 1
-                        acc_reward = 0.
-                        print(f"error in pred_code_i, not in [0, 1], acc_reward={acc_reward}\nprogram:\n{program}\n---\nanswer:\n{answer}\n---\nimports:\n{imports}\n---\n")
-                    if acc_reward > 0.0:
-                        correct_predictions.append(data_dict)
-                elif problem_types[i].endswith('code_o'):
-                    acc_reward = executor.eval_output_prediction(code=program, gold_output=gold_output, agent_output=answer, imports=list(set(imports)))
-                    # problematic, but we did not encounter too much of this
-                    if acc_reward is None:
-                        all_scores['none_count'] += 1
-                        acc_reward = 0.
-                        print(f"error in pred_code_o, not in [0, 1], acc_reward={acc_reward}\nprogram:\n{program}\n---\nanswer:\n{answer}\n---\nimports:\n{imports}\n---\n")
-                    if acc_reward > 0.0:
-                        correct_predictions.append(data_dict)
-                elif problem_types[i].endswith('code_e'): # string matching for errors
-                    answer = answer.split(' ')[0].split(':')[0]
-                    if answer.lower() == gold_output.lower():
-                        acc_reward = 1.0
-                        correct_predictions.append(data_dict)
-                    else:
-                        acc_reward = 0.0
-                elif problem_types[i].endswith('code_f'):
-                    input_output_accs = []
-                    program = data_dict['answer']['snippet']
-                    for inpt, outpt in zip(hidden_inputs, hidden_outputs):
-                        input_output_acc = executor.eval_input_prediction(
-                            code=program,
-                            gold_output=outpt,
-                            agent_input=inpt,
-                            imports=list(set(imports)),
-                        )
-                        if input_output_acc is not None:
-                            input_output_accs.append(input_output_acc)
-                    acc_reward = np.mean(input_output_accs) if input_output_accs else 0.0
-                    if self.code_f_reward_type == 'binary':
-                        acc_reward = 1.0 if acc_reward == 1.0 else 0.0
-                    elif self.code_f_reward_type == 'if_one_correct':
-                        acc_reward = 1.0 if acc_reward > 0 else 0.0
-                    # note that if code_f_reward_type==accuracy, it is already handled in the above
-                    if acc_reward > 0:
-                        correct_predictions.append(data_dict)
-                else:
-                    raise ValueError(f"Invalid problem type: {problem_types[i]}")
-
-                if self.split == 'train':
-                    if data_dicts[i]['format_score'] > 0:
-                        if acc_reward > 0:
-                            reward_tensor[i, valid_response_length - 1] = acc_reward
+                            mean_p01 = (~np.any(wrong_code_correct_case_table, axis=0)).astype(float)
+                        reward_scale[correct_case_list] = reward_scale[correct_case_list] * mean_p01
+                    if len(wrong_case_list):
+                        wrong_code_wrong_case_table = all_case_table_i[wrong_code_list, :][:, wrong_case_list].copy()
+                        if True:  # TODO: True by default, but suggest False after 100+ optimization steps
+                            mean_p00 = np.mean(wrong_code_wrong_case_table, 0)
                         else:
-                            reward_tensor[i, valid_response_length - 1] = -0.5
-                    else:
-                        reward_tensor[i, valid_response_length - 1] = -1.0
-                elif self.split == 'test': # only acc reward for eval
-                    if acc_reward > 0:
-                        reward_tensor[i, valid_response_length - 1] = 1.0
-                    else:
-                        reward_tensor[i, valid_response_length - 1] = 0.0
-                acc_rewards.append(acc_reward)
-            all_scores['accuracy'] = acc_rewards
-            all_scores['format_score'] = [data_dicts[i]['format_score'] for i in range(len(data))]
-            all_scores['none_ratio'] = all_scores['none_count'] / len(data)
-        return reward_tensor, all_scores, valid_programs, correct_predictions
+                            mean_p00 = (np.any(wrong_code_wrong_case_table, axis=0)).astype(float)
+                        reward_scale[wrong_case_list] = reward_scale[wrong_case_list] * mean_p00
+                    case_reward = case_reward * reward_scale
+                
+                case_reward = normalize_reward(case_reward)
+                if case_reward is not None:
+                    case_reward = length_regularize(case_reward, data[i]["case_response_length"])
+                    if case_reward is not None:
+                        case_reward = case_reward.tolist()
+                        for j in range(len(case_reward)):
+                            # case_data_i = {}
+                            # case_data_i["prompt"] = data[i]["case_generation_prompt"]
+                            # if data[i]["case_response_length"][j] < max_generation_len:
+                            #     case_data_i["response"] = data[i]["full_case_generation"][j] + "<|im_end|>"
+                            # else:
+                            #     case_data_i["response"] = data[i]["full_case_generation"][j]
+                            # case_data_i["reward"] = case_reward[j]
+                            # case_data.append(case_data_i)
+                            prompt_ids = case_batch[i*k_case + j].batch['prompts']
+                            prompt_length = prompt_ids.shape[-1]
+                            valid_response_length = case_batch[i*k_case + j].batch['attention_mask'][prompt_length:].sum()
+                            case_reward_tensor[i*k_case + j, valid_response_length - 1] = case_reward[j]
+
+        return code_reward_tensor, case_reward_tensor
 
     def _get_problem_generator_rewards_and_valid_programs(
         self,

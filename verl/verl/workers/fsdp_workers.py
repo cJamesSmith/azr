@@ -443,6 +443,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
+        print("==========================================================")
         prompts = prompts.to('cuda')
 
         assert self._is_rollout

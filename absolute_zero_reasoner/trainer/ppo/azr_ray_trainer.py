@@ -28,7 +28,7 @@ from verl.trainer.ppo.ray_trainer import (
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProto
 
 from absolute_zero_reasoner.utils.tracking import ReasonRLTracking
-from absolute_zero_reasoner.data_construction.constructor import get_gen_code_io_data, get_pred_code_io_data
+from absolute_zero_reasoner.data_construction.constructor import get_code_case_data, get_case_io_data
 from absolute_zero_reasoner.trainer.ppo.reason_rl_ray_trainer import ReasonRLRayPPOTrainer
 from absolute_zero_reasoner.utils.dataset.rl_dataset import RLHFDataset
 from absolute_zero_reasoner.rewards.code_reward import parse_code_input_output, parse_inputs_message
@@ -286,17 +286,17 @@ class DatasetManager:
 
     def update_seed(self, entries):
         with self.locks['seed']:
-            existing = {json.dumps(d, sort_keys=True): True for d in self.datasets['seed']}
-            new_entries = [e for e in entries if json.dumps(e, sort_keys=True) not in existing]
+            # existing = {json.dumps(d, sort_keys=True): True for d in self.datasets['seed']}
+            # new_entries = [e for e in entries if json.dumps(e, sort_keys=True) not in existing]
 
-            for entry in new_entries:
-                if 'input' in entry and '_input_type' in entry:
-                    self.count_element(entry['input'], entry['_input_type'], 'input')
-                if 'output' in entry and '_output_type' in entry:
-                    self.count_element(entry['output'], entry['_output_type'], 'output')
+            # for entry in new_entries:
+            #     if 'input' in entry and '_input_type' in entry:
+            #         self.count_element(entry['input'], entry['_input_type'], 'input')
+            #     if 'output' in entry and '_output_type' in entry:
+            #         self.count_element(entry['output'], entry['_output_type'], 'output')
 
-            self.datasets['seed'].extend(new_entries)
-            return len(new_entries)
+            self.datasets['seed'].extend(entries)
+            return len(entries)
 
     def update_error_seed(self, entries):
         with self.locks['error_seed'], self.locks['error_types']:
@@ -607,165 +607,80 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
         # Force garbage collection
         gc.collect()
 
-    def _create_train_code_gen_dataloader(
+    def _create_train_code_case_dataloader(
         self,
-        problem_type: str,
-        data_len: int,
-        dataset_key: str = None,
-        seeding: bool = False,
+        data_len: int
     ) -> DataLoader:
-        if dataset_key is None:
-            if problem_type == 'code_i':
-                dataset_key = 'input'
-            elif problem_type == 'code_o':
-                dataset_key = 'output'
-            elif problem_type == 'code_e':
-                dataset_key = 'error'
-            elif problem_type == 'code_f':
-                # For code_f we use merged snippets from all datasets
-                io_data = ray.get(self.dataset_manager.get_snippets.remote())
-            else:
-                raise ValueError(f'Invalid problem type: {problem_type}')
-        
-        if problem_type != 'code_f':
-            io_data = ray.get(self.dataset_manager.get_dataset.remote(dataset_key))
+        io_data = ray.get(self.dataset_manager.get_dataset.remote('seed'))
 
-        parquet_path = (self._code_dir / f'train_gen_{problem_type}.parquet').as_posix()
-        os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
+        # code dataloader
+        code_parquet_path = (self._code_dir / f'train_code.parquet').as_posix()
+        case_parquet_path = (self._code_dir / f'train_case.parquet').as_posix()
+        os.makedirs(os.path.dirname(code_parquet_path), exist_ok=True)
 
-        # Handle weights strategy
-        if problem_type == 'code_f' and not seeding:
-            if self.config.azr.gen_data_probabilities_strategy == 'step':
-                entries_with_steps = ray.get(self.dataset_manager.get_snippets_with_steps.remote())
-                weights = [w + 1 for _, w in entries_with_steps] if entries_with_steps else [1.0]*len(io_data)
-            else:
-                weights = [1.0] * len(io_data)
-        elif dataset_key == 'seed':
-            weights = None
-        elif self.config.azr.gen_data_probabilities_strategy == 'uniform':
-            weights = [1.0] * len(io_data)
-        elif self.config.azr.gen_data_probabilities_strategy == 'step':
-            weights = [w + 1 for w in ray.get(self.dataset_manager.get_steps_dataset.remote(dataset_key))]
-        else:
-            raise ValueError(f"Unknown strategy: {self.config.azr.gen_data_probabilities_strategy}")
-
-        # Common parameters for get_gen_code_io_data
+        # Common parameters for get_code_io_data
         gen_params = {
             'io_data': io_data,
             'target_data_len': data_len,
-            'problem_type': problem_type,
             'content_max_length': self.config.azr.data_selection_strategy.content_max_length,
-            'io_n': 1 if problem_type == 'code_f' else self.config.azr.data_selection_strategy.io_n,
-            'instruction_type': self.config.reward_fn.extraction_type,
-            'output_path': parquet_path,
+            'code_parquet_path': code_parquet_path,
+            'case_parquet_path': case_parquet_path,
             'split': 'train',
             'tokenizer': self.tokenizer,
-            'banned_keywords': self.config.azr.data_selection_strategy.banned_words,
-            'banned_assertion_keywords': self.config.azr.data_selection_strategy.banned_keywords_for_errors_and_exceptions,
-            'weights': weights,
-            'enable_composite_function': self.config.azr.data_selection_strategy.composite_start_step > 0 and self.global_steps >= self.config.azr.data_selection_strategy.composite_start_step,
-            'composite_function_n_min': self.config.azr.data_selection_strategy.composite_function_n_min,
-            'composite_function_n_max': self.config.azr.data_selection_strategy.composite_function_n_max,
-            'composite_chance': self.config.azr.data_selection_strategy.composite_chance,
-            'remove_after_return': self.config.azr.reward.generation_reward_config.remove_after_return,
-            'remove_input_from_snippet': self.config.azr.reward.generation_reward_config.remove_input_from_snippet,
-            'include_references': self.config.azr.reward.generation_reward_config.include_references,
         }
 
-        # Add code_f specific parameters
-        if problem_type == 'code_f':
-            gen_params.update({
-                'num_inputs': self.config.azr.data_selection_strategy.num_inputs,
-            })
+        selected_data = get_code_case_data(**gen_params)
 
-        get_gen_code_io_data(**gen_params)
-
-        code_gen_train_dataset = RLHFDataset(
-            parquet_files=parquet_path,
+        code_train_dataset = RLHFDataset(
+            parquet_files=code_parquet_path,
             tokenizer=self.tokenizer,
             prompt_key=self.config.data.prompt_key,
             max_prompt_length=self.config.data.max_prompt_length,
             filter_prompts=True,
             return_raw_chat=self.config.data.get('return_raw_chat', False),
             truncation='error',
-            extra_source_key=f"gen_{problem_type}_train"
+            extra_source_key=f"code_train"
+        )
+        case_train_dataset = RLHFDataset(
+            parquet_files=case_parquet_path,
+            tokenizer=self.tokenizer,
+            prompt_key=self.config.data.prompt_key,
+            max_prompt_length=self.config.data.max_prompt_length,
+            filter_prompts=True,
+            return_raw_chat=self.config.data.get('return_raw_chat', False),
+            truncation='error',
+            extra_source_key=f"case_train"
         )
 
-        if self.config.data.shuffle:
-            train_dataloader_generator = torch.Generator()
-            train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
-            sampler = RandomSampler(code_gen_train_dataset, generator=train_dataloader_generator)
-        else:
-            sampler = SequentialSampler(code_gen_train_dataset)
+        code_sampler = SequentialSampler(code_train_dataset)
+        case_sampler = SequentialSampler(case_train_dataset)
 
         return iter(DataLoader(
-            dataset=code_gen_train_dataset,
+            dataset=code_train_dataset,
             batch_size=self.config.data.train_batch_size,
             drop_last=True,
             collate_fn=collate_fn,
-            sampler=sampler
-        ))
+            sampler=code_sampler
+        )), iter(DataLoader(
+            dataset=case_train_dataset,
+            batch_size=self.config.data.train_batch_size,
+            drop_last=True,
+            collate_fn=collate_fn,
+            sampler=case_sampler
+        )), selected_data
 
-    def _create_train_code_pred_dataloader(self, problem_type: str, data_len: int) -> DataLoader:
-        if problem_type == 'code_i':
-            dataset_key = 'input'
-        elif problem_type == 'code_o':
-            dataset_key = 'output'
-        elif problem_type == 'code_e':
-            dataset_key = 'error'
-        elif problem_type == 'code_f':
-            dataset_key = 'problem'
-        else:
-            raise ValueError(f'Invalid problem type: {problem_type}')
-        full_dataset = ray.get(self.dataset_manager.get_dataset.remote(dataset_key))
+    def _create_train_case_dataloader(self, data_len: int) -> DataLoader:
+        io_data = ray.get(self.dataset_manager.get_dataset.remote('seed'))
+        parquet_path = (self._code_dir / f'train_case.parquet').as_posix()
+        os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
 
-        strategy = self.config.azr.pred_data_mix_strategy
-
-        if strategy == "step":
-            # Get entries with their creation steps
-            entries_with_steps = ray.get(self.dataset_manager.get_dataset_with_steps.remote(dataset_key))
-            if not entries_with_steps:
-                selected_data = []
-            else:
-                entries, steps = zip(*entries_with_steps)
-                # Calculate inverse step weights (newer entries get higher weight)
-                selected_indices = random.choices(
-                    range(len(entries)),
-                    weights=steps,
-                    k=min(data_len, len(entries))
-                )
-                selected_data = [entries[i] for i in selected_indices]
-        elif strategy == "uniform_total":
-            selected_data = random.sample(full_dataset, min(len(full_dataset), data_len))
-        elif strategy == "max_new":
-            total_recent = ray.get(self.dataset_manager.get_recent_additions.remote(
-                dataset_key, self.global_steps, self._past_epoch_window
-            ))
-            new_programs = full_dataset[-total_recent:] if total_recent > 0 else []
-            new_samples = random.sample(new_programs, min(len(new_programs), data_len))
-            remaining = data_len - len(new_samples)
-            selected_data = new_samples + random.sample(full_dataset, remaining)
-        elif strategy == "half_new":
-            total_recent = ray.get(self.dataset_manager.get_recent_additions.remote(
-                dataset_key, self.global_steps, self._past_epoch_window
-            ))
-            new_programs = full_dataset[-total_recent:] if total_recent > 0 else []
-            new_count = min(len(new_programs), data_len//2)
-            base_count = data_len - new_count
-            selected_data = random.sample(new_programs, new_count) + random.sample(full_dataset, base_count)
-        else:
-            raise ValueError(f"Unknown strategy: {strategy}")
-
-        parquet_path = (self._code_dir / f'train_pred_{problem_type}.parquet').as_posix()
-        get_pred_code_io_data(
-            io_data=selected_data,
+        get_case_io_data(
+            io_data=io_data,
             target_data_len=data_len,
-            problem_type=problem_type,
             content_max_length=self.config.azr.data_selection_strategy.content_max_length,
             output_path=parquet_path,
             split='train',
             tokenizer=self.tokenizer,
-            instruction_type=self.config.reward_fn.extraction_type,
         )
         code_pred_train_dataset = RLHFDataset(parquet_files=parquet_path,
                                          tokenizer=self.tokenizer,
@@ -774,7 +689,7 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                                          filter_prompts=True,
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
                                          truncation='error',
-                                         extra_source_key=f"pred_{problem_type}_train")
+                                         extra_source_key=f"case_train")
         # use sampler for better ckpt resume
         if self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
@@ -792,183 +707,97 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
         assert len(code_pred_train_dataloader) >= 1
         return iter(code_pred_train_dataloader)
 
-    def _compute_batch(self, batch: DataProto, metrics: dict, timing_raw: dict, problem_type: str, executor: PythonExecutor) -> tuple[DataProto, dict]:
-        PrettyPrinter.section_header(f"Computing batch for {problem_type}")
+    def _compute_batch(self, code_batch: DataProto, case_batch: DataProto, selected_data, metrics: dict, timing_raw: dict, executor: PythonExecutor) -> tuple[DataProto, dict]:
+        PrettyPrinter.section_header(f"Computing batch for code and case")
         # pop those keys for generation
-        gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+        code_gen_batch = code_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+        code_gen_batch.meta_info = {
+                'do_sample': True,
+                'n': self.config.azr.sample.k_code,
+            }
+        case_gen_batch = case_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+        case_gen_batch.meta_info = {
+                'do_sample': True,
+                'n': self.config.azr.sample.k_case,
+            }
 
         # generate a batch
-        with _timer(f'gen/{problem_type}', timing_raw):
-            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+        with _timer(f'gen/code', timing_raw):
+            code_gen_batch_output = self.actor_rollout_wg.generate_sequences(code_gen_batch)
+        with _timer(f'gen/case', timing_raw):
+            case_gen_batch_output = self.actor_rollout_wg.generate_sequences(case_gen_batch)
 
-        batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                dtype=object)
+        code_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(code_batch.batch))], dtype=object)
+        case_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(case_batch.batch))], dtype=object)
         # repeat to align with repeated responses in rollout
-        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-        batch = batch.union(gen_batch_output)
+        code_batch = code_batch.repeat(repeat_times=self.config.azr.sample.k_code, interleave=True)
+        case_batch = case_batch.repeat(repeat_times=self.config.azr.sample.k_case, interleave=True)
+
+        code_batch = code_batch.union(code_gen_batch_output)
+        case_batch = case_batch.union(case_gen_batch_output)
 
         # balance the number of valid tokens on each dp rank
-        self._balance_batch(batch, metrics=metrics)
+        self._balance_batch(code_batch, metrics=metrics)
+        self._balance_batch(case_batch, metrics=metrics)
 
         # compute global_valid tokens
-        batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+        code_batch.meta_info['global_token_num'] = torch.sum(code_batch.batch['attention_mask'], dim=-1).tolist()
+        case_batch.meta_info['global_token_num'] = torch.sum(case_batch.batch['attention_mask'], dim=-1).tolist()
 
         # recompute old_log_probs
-        with _timer(f'old_log_prob/{problem_type}', timing_raw):
-            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-            batch = batch.union(old_log_prob)
+        with _timer(f'old_log_prob/code', timing_raw):
+            old_log_prob_code = self.actor_rollout_wg.compute_log_prob(code_batch)
+            code_batch = code_batch.union(old_log_prob_code)
+
+        with _timer(f'old_log_prob/case', timing_raw):
+            old_log_prob_case = self.actor_rollout_wg.compute_log_prob(case_batch)
+            case_batch = case_batch.union(old_log_prob_case)
 
         if self.use_reference_policy:
-            with _timer(f'ref/{problem_type}', timing_raw):
-                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                batch = batch.union(ref_log_prob)
+            with _timer(f'ref/code', timing_raw):
+                ref_log_prob_code = self.ref_policy_wg.compute_ref_log_prob(code_batch)
+                code_batch = code_batch.union(ref_log_prob_code)
+
+            with _timer(f'ref/case', timing_raw):
+                ref_log_prob_case = self.ref_policy_wg.compute_ref_log_prob(case_batch)
+                case_batch = case_batch.union(ref_log_prob_case)
 
         # compute values
         if self.use_critic:
-            with _timer(f'values/{problem_type}', timing_raw):
-                values = self.critic_wg.compute_values(batch)
-                batch = batch.union(values)
+            with _timer(f'values/code', timing_raw):
+                values_code = self.critic_wg.compute_values(code_batch)
+                code_batch = code_batch.union(values_code)
 
-        with _timer(f'adv/{problem_type}', timing_raw):
-            if self.use_rm:
-                reward_tensor = self.rm_wg.compute_rm_score(batch)
-                batch = batch.union(reward_tensor)
+            with _timer(f'values/case', timing_raw):
+                values_case = self.critic_wg.compute_values(case_batch)
+                case_batch = case_batch.union(values_case)
 
-            input_type_counters, output_type_counters, error_type_counters = None, None, None
-            # Get the appropriate type counters based on problem type
-            if problem_type == 'gen_code_i':
-                input_type_counters = ray.get(self.dataset_manager.get_type_counter.remote('input'))
-            elif problem_type == 'gen_code_o':
-                output_type_counters = ray.get(self.dataset_manager.get_type_counter.remote('output'))
-            elif problem_type == 'gen_code_e':
-                error_type_counters = ray.get(self.dataset_manager.get_type_counter.remote('error'))
-            elif problem_type == 'gen_code_f':
-                input_type_counters = ray.get(self.dataset_manager.get_type_counter.remote('input'))
-                output_type_counters = ray.get(self.dataset_manager.get_type_counter.remote('output'))
+        with _timer(f'adv', timing_raw):
+            # if self.use_rm:  # INFO: We do not use reward model (rm) here
+            #     reward_tensor = self.rm_wg.compute_rm_score(batch)
+            #     batch = batch.union(reward_tensor)
 
-            # make sure actor_rollout_wg n > 1
-            if problem_type.startswith('gen'):
-                reward_fn_kwargs = {
-                    'data': batch,
-                    'problem_type': problem_type,
+
+            reward_fn_kwargs = {
+                    'data': [code_batch, case_batch, selected_data],
                     'executor': executor, # need this to check for execution errors
                     'rollout_actor_wg': self.actor_rollout_wg, # need this to estimate difficulty reward
                     'banned_words': self.config.azr.data_selection_strategy.banned_words, # need this to check for banned words
                     'n_samples': self.config.azr.reward.n_samples,
-                    'input_type_counters': input_type_counters,
-                    'output_type_counters': output_type_counters,
-                    'error_type_counters': error_type_counters,
+                    'max_ground_truth_test': self.config.azr.sample.max_ground_truth_test,
+                    'k_code': self.config.azr.sample.k_code,
+                    'k_case': self.config.azr.sample.k_case,
                 }
-            elif problem_type.startswith('pred'):
-                reward_fn_kwargs = {
-                    'data': batch, 
-                    'problem_type': problem_type, 
-                    'executor': executor,
-                }
-            with _timer(f'reward_fn/{problem_type}', timing_raw):
-                PrettyPrinter.status("REWARD", f"Computing rewards for {problem_type}...", "info")
-                reward_tensor, train_metrics, valid_programs, correct_predictions = self.reward_fn(**reward_fn_kwargs)
-                PrettyPrinter.status("REWARD", f"Found {len(valid_programs) if valid_programs else 0} valid programs", "success")
+            with _timer(f'reward_fn', timing_raw):
+                PrettyPrinter.status("REWARD", f"Computing rewards ...", "info")
+                # reward_tensor, train_metrics, valid_programs, correct_predictions = self.reward_fn(**reward_fn_kwargs)
+                code_reward_tensor, case_reward_tensor = self.reward_fn(**reward_fn_kwargs)
 
-                # get avg_program lines
-                avg_program_lines = sum(len(program['snippet'].split('\n')) for program in valid_programs) / len(valid_programs) if valid_programs else 0
-                train_metrics[f'{problem_type}/avg_program_lines'] = avg_program_lines
+            # metrics.update(train_metrics)  # TODO: We should update metrics here
+            code_batch.batch['token_level_scores'] = code_reward_tensor
+            case_batch.batch['token_level_scores'] = case_reward_tensor
 
-            # Log new programs if available
-            if valid_programs and self.config.azr.random_print_max_programs > 0:
-                PrettyPrinter.section_header(f"New {problem_type} Programs")
-                max_print = min(self.config.azr.random_print_max_programs, len(valid_programs))
-                for program in random.sample(valid_programs, max_print):
-                    PrettyPrinter.status(f"PROBLEM TYPE", problem_type, "info")
-                    if 'code_f' not in problem_type:
-                        PrettyPrinter.code_block(program['snippet'], "python")
-                        PrettyPrinter.status("INPUT", program['input'], "info")
-                        PrettyPrinter.status("OUTPUT", program['output'], "info")
-                        PrettyPrinter.status("THOUGHT", program['thought'], "info")
-                        PrettyPrinter.status("COMPOSITE FUNCTION", "YES!" if len(program['composite_functions']) > 0 else "NO!", "info")
-                    else:
-                        PrettyPrinter.code_block(program['snippet'], "python")
-                        PrettyPrinter.status("INPUT", program['inputs'], "info")
-                        PrettyPrinter.status("OUTPUT", program['outputs'], "info")
-                        PrettyPrinter.status("MESSAGE", program['message'], "info")
-                        PrettyPrinter.status("THOUGHT", program['thought'], "info")
-                    print("\n" + "-"*80 + "\n")
-            if correct_predictions and self.config.azr.random_print_max_programs > 0:
-                PrettyPrinter.section_header(f"New {problem_type} Programs")
-                max_print = min(self.config.azr.random_print_max_programs, len(correct_predictions))
-                for program in random.sample(correct_predictions, max_print):
-                    if 'code_f' not in problem_type:
-                        PrettyPrinter.code_block(program['program'], "python")
-                        # also print the problem_type
-                        PrettyPrinter.status(f"PROBLEM TYPE", problem_type, "info")
-                        PrettyPrinter.status("INPUT", program['input'], "info")
-                        PrettyPrinter.status("OUTPUT", program['output'], "info")
-                        PrettyPrinter.status("THOUGHT", program['thought'], "info")
-                    else:
-                        PrettyPrinter.code_block(program['answer']['snippet'], "python")
-                        PrettyPrinter.code_block(program['answer']['gold_program'], "python (gold)")
-                        PrettyPrinter.status("HIDDEN INPUT", program['hidden_inputs'], "info")
-                        PrettyPrinter.status("HIDDEN OUTPUT", program['hidden_outputs'], "info")
-                        PrettyPrinter.status("GIVEN INPUT", program['given_inputs'], "info")
-                        PrettyPrinter.status("GIVEN OUTPUT", program['given_outputs'], "info")
-                        PrettyPrinter.status("MESSAGE", program['answer']['message'], "info")
-                        PrettyPrinter.status("THOUGHT", program['answer']['thought'], "info")
-                    print("\n" + "-"*80 + "\n")
-
-            if problem_type.endswith('code_i'):
-                if valid_programs:
-                    # Process locally first
-                    processed_programs = process_elements(valid_programs)
-                    # Then batch add to dataset
-                    ray.get(self.dataset_manager.add_input_batch.remote(processed_programs, self.global_steps))
-            elif problem_type.endswith('code_o'):
-                if valid_programs:
-                    processed_programs = process_elements(valid_programs)
-                    ray.get(self.dataset_manager.add_output_batch.remote(processed_programs, self.global_steps))
-            elif problem_type.endswith('code_e'):
-                if valid_programs:
-                    processed_programs = process_elements(valid_programs)
-                    ray.get(self.dataset_manager.add_error_batch.remote(processed_programs, self.global_steps))
-            elif problem_type.endswith('code_f'):
-                if valid_programs:
-                    processed_programs = process_elements(valid_programs)
-                    ray.get(self.dataset_manager.add_problem_batch.remote(processed_programs, self.global_steps))
-            else:
-                raise ValueError(f'Invalid problem type: {problem_type}')
-
-            if self.config.azr.data_selection_strategy.max_programs is not None and problem_type.endswith('code_i'):
-                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.azr.data_selection_strategy.max_programs, 'input'))
-                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from input dataset, max programs is {self.config.azr.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
-            if self.config.azr.data_selection_strategy.max_programs is not None and problem_type.endswith('code_o'):
-                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.azr.data_selection_strategy.max_programs, 'output'))
-                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from output dataset, max programs is {self.config.azr.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
-            if self.config.azr.data_selection_strategy.max_programs is not None and problem_type.endswith('code_e'):
-                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.azr.data_selection_strategy.max_programs, 'error'))
-                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from error dataset, max programs is {self.config.azr.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
-            if self.config.azr.data_selection_strategy.max_programs is not None and problem_type.endswith('code_f'):
-                truncated_length, before_length = ray.get(self.dataset_manager.truncate_datasets.remote(self.config.azr.data_selection_strategy.max_programs, 'problem'))
-                PrettyPrinter.status("DATA", f"Truncated {truncated_length} programs from problem dataset, max programs is {self.config.azr.data_selection_strategy.max_programs}, dataset size was {before_length} before truncation", "info")
-
-            train_metrics = {f'{problem_type}/{k}': np.mean(v) for k, v in train_metrics.items()}
-            # log the number of valid programs added to the dataset
-            if problem_type.startswith('gen'):
-                if problem_type.endswith('code_i'):
-                    dataset_key = 'input' 
-                elif problem_type.endswith('code_o'):
-                    dataset_key = 'output'
-                elif problem_type.endswith('code_e'):
-                    dataset_key = 'error'
-                elif problem_type.endswith('code_f'):
-                    dataset_key = 'problem'
-                else:
-                    raise ValueError(f'Invalid problem type: {problem_type}')
-                train_metrics[f'{problem_type}/num_valid_programs'] = ray.get(
-                    self.dataset_manager.get_recent_additions.remote(
-                        dataset_key, self.global_steps, self._past_epoch_window
-                    )
-                )
-            metrics.update(train_metrics)
-            batch.batch['token_level_scores'] = reward_tensor
+            batch = DataProto.concat([code_batch, case_batch])
 
             if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
                 batch, kl_metrics = apply_kl_penalty(batch,
@@ -1422,6 +1251,8 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
         if self.config.actor_rollout_ref.model.pretrained_tokenizer:
             self.tokenizer.chat_template = "{%- for message in messages -%}{{- '\n' if not loop.first -}}{{- message['content'] -}}{%- endfor -%}"
 
+        breakpoint()
+        
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True) and self.global_steps == 0:
             PrettyPrinter.section_header(f"Starting Initial Validation")
@@ -1449,119 +1280,16 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
 
             # Initialize with defaults
             seed_dataset = []
-            error_dataset = []
-            code_f_dataset = []
 
             # Load or generate seed dataset if needed
             if need_seed_dataset:
                 if self.config.azr.seed_dataset is not None:
                     PrettyPrinter.status("DATA", "Loading seed dataset from file...", "info")
                     with open(self.config.azr.seed_dataset, 'r') as file:
-                        seed_dataset = [json.loads(line) for line in file]
-                    seed_dataset = seed_dataset[:self.config.azr.data_selection_strategy.data_len * 
-                                                self.config.azr.data_selection_strategy.seed_batch_factor]
+                        # seed_dataset = [json.loads(line) for line in file]  # for *.jsonl file
+                        seed_dataset = json.load(file)  # for *.json file
                     PrettyPrinter.status("DATA", f"Loaded {len(seed_dataset)} seed entries", "success")
-                    if 'code_f' in self.config.azr.problem_types: # we need seed to generate code_f
-                        ray.get(self.dataset_manager.update_seed.remote(seed_dataset))
-                else:
-                    PrettyPrinter.status("DATA", "Seed dataset not provided, will generate", "info")
-
-            # Load or prepare to generate error dataset if needed
-            if need_error_dataset:
-                if self.config.azr.error_seed_dataset is not None:
-                    PrettyPrinter.status("DATA", "Loading error seed dataset from file...", "info")
-                    with open(self.config.azr.error_seed_dataset, 'r') as file:
-                        error_dataset = [json.loads(line) for line in file]
-                    error_dataset = error_dataset[:self.config.azr.data_selection_strategy.data_len * 
-                                                self.config.azr.data_selection_strategy.seed_batch_factor]
-                    PrettyPrinter.status("DATA", f"Loaded {len(error_dataset)} error entries", "success")
-                else:
-                    PrettyPrinter.status("DATA", "Error seed dataset not provided, will generate", "info")
-
-            if need_code_f_dataset:
-                if self.config.azr.code_f_seed_dataset is not None:
-                    PrettyPrinter.status("DATA", "Loading code f seed dataset from file...", "info")
-                    with open(self.config.azr.code_f_seed_dataset, 'r') as file:
-                        code_f_dataset = [json.loads(line) for line in file]
-                    code_f_dataset = code_f_dataset[:self.config.azr.data_selection_strategy.data_len * 
-                                                self.config.azr.data_selection_strategy.seed_batch_factor]
-                    PrettyPrinter.status("DATA", f"Loaded {len(code_f_dataset)} code f entries", "success")
-
-            # Generate missing datasets if needed
-            need_to_generate_seed = need_seed_dataset and len(seed_dataset) == 0
-            need_to_generate_error = need_error_dataset and len(error_dataset) == 0
-            need_to_generate_code_f = need_code_f_dataset and len(code_f_dataset) == 0
-
-            if need_to_generate_seed or need_to_generate_error or need_to_generate_code_f:
-                sample_problem_types = []
-                for problem_type in self.config.azr.problem_types:
-                    if problem_type == 'code_e' and need_to_generate_error:
-                        sample_problem_types.append(problem_type)
-                    elif problem_type != 'code_e' and need_to_generate_seed:
-                        sample_problem_types.append(problem_type)
-                    elif problem_type == 'code_f' and need_to_generate_code_f:
-                        sample_problem_types.append(problem_type)
-                PrettyPrinter.status("DATA", f"Generating missing datasets for {', '.join(sample_problem_types)}...", "info")
-                generated_seed, generated_error, generated_code_f = self._init_seed_dataset(problem_types=sample_problem_types)
-
-                if need_to_generate_seed:
-                    seed_dataset = generated_seed
-                    PrettyPrinter.status("DATA", f"Generated {len(seed_dataset)} seed entries", "success")
-
-                if need_to_generate_error:
-                    error_dataset = generated_error
-                    PrettyPrinter.status("DATA", f"Generated {len(error_dataset)} error entries", "success")
-                
-                if need_to_generate_code_f:
-                    code_f_dataset = generated_code_f
-                    PrettyPrinter.status("DATA", f"Generated {len(code_f_dataset)} code f entries", "success")
-
-                if self.config.azr.get('generate_seed_dataset_only', False):
-                    return
-
-            # Now initialize datasets in dataset manager
-            if need_seed_dataset:
-                assert len(seed_dataset) >= self.config.azr.data_selection_strategy.data_len
-
-                if 'code_i' in self.config.azr.problem_types:
-                    # Process locally first
-                    processed_seed_dataset = process_elements(seed_dataset)
-                    # Initialize input dataset with seed data
-                    ray.get(self.dataset_manager.add_input_batch.remote(processed_seed_dataset, self.global_steps))
-                    PrettyPrinter.status(
-                        "DATA", 
-                        f"Input dataset initialized with {len(seed_dataset)} entries", 
-                        "success"
-                    )
-
-                if 'code_o' in self.config.azr.problem_types:
-                    processed_seed_dataset = process_elements(seed_dataset)
-                    ray.get(self.dataset_manager.add_output_batch.remote(processed_seed_dataset, self.global_steps))
-                    PrettyPrinter.status(
-                        "DATA", 
-                        f"Output dataset initialized with {len(seed_dataset)} entries", 
-                        "success"
-                    )
-
-            if need_error_dataset:
-                assert len(error_dataset) >= self.config.azr.data_selection_strategy.data_len
-                processed_error_dataset = process_elements(error_dataset)
-                ray.get(self.dataset_manager.add_error_batch.remote(processed_error_dataset, self.global_steps))
-                PrettyPrinter.status(
-                    "DATA", 
-                    f"Error dataset initialized with {len(error_dataset)} entries", 
-                    "success"
-                )
-
-            if need_code_f_dataset:
-                assert len(code_f_dataset) >= self.config.azr.data_selection_strategy.data_len
-                processed_code_f_dataset = process_elements(code_f_dataset)
-                ray.get(self.dataset_manager.add_problem_batch.remote(processed_code_f_dataset, self.global_steps))
-                PrettyPrinter.status(
-                    "DATA", 
-                    f"Code f dataset initialized with {len(code_f_dataset)} entries", 
-                    "success"
-                )
+                    ray.get(self.dataset_manager.update_seed.remote(seed_dataset))
 
         # we start from step 1
         self.global_steps += 1
@@ -1582,45 +1310,8 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             )
 
             data_len = self.config.data.train_batch_size * self.config.azr.data_selection_strategy.update_iteration
-            if 'code_i' in self.config.azr.problem_types:
-                gen_code_i_dataloader = self._create_train_code_gen_dataloader(
-                    problem_type='code_i',
-                    data_len=data_len,
-                )
-                pred_code_i_dataloader = self._create_train_code_pred_dataloader(
-                    problem_type='code_i',
-                    data_len=data_len,
-                )
-            if 'code_o' in self.config.azr.problem_types:
-                gen_code_o_dataloader = self._create_train_code_gen_dataloader(
-                    problem_type='code_o',
-                    data_len=data_len,
-                )
-                pred_code_o_dataloader = self._create_train_code_pred_dataloader(
-                    problem_type='code_o',
-                    data_len=data_len,
-                )
+            code_dataloader, case_dataloader, selected_data = self._create_train_code_case_dataloader(data_len=data_len)
 
-            if 'code_e' in self.config.azr.problem_types:
-                gen_code_e_dataloader = self._create_train_code_gen_dataloader(
-                    problem_type='code_e',
-                    data_len=data_len,
-                )
-                pred_code_e_dataloader = self._create_train_code_pred_dataloader(
-                    problem_type='code_e',
-                    data_len=data_len,
-                )
-
-            if 'code_f' in self.config.azr.problem_types:
-                gen_code_f_dataloader = self._create_train_code_gen_dataloader(
-                    data_len=data_len,
-                    problem_type='code_f',
-                    seeding=False,
-                )
-                pred_code_f_dataloader = self._create_train_code_pred_dataloader(
-                    problem_type='code_f',
-                    data_len=data_len,
-                )
             for _ in range(self.config.azr.data_selection_strategy.update_iteration):
                 metrics = {}
                 timing_raw = {}
@@ -1633,56 +1324,12 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                             self.cleanup()
                         self._last_cleanup_step = self.global_steps
 
-                    if 'code_i' in self.config.azr.problem_types:
-                        if not self.pretrain_pred:
-                            batch_dict = next(gen_code_i_dataloader)
-                            batch: DataProto = DataProto.from_single_dict(batch_dict)
-                            batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_i', executor=self._executor)
-                            if self.config.azr.train_propose:
-                                batches[f'gen_code_i'] = batch
-                        batch_dict = next(pred_code_i_dataloader)
-                        batch: DataProto = DataProto.from_single_dict(batch_dict)
-                        batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='pred_code_i', executor=self._executor)
-                        batches[f'pred_code_i'] = batch
-
-                    if 'code_o' in self.config.azr.problem_types:
-                        if not self.pretrain_pred:
-                            batch_dict = next(gen_code_o_dataloader)
-                            batch: DataProto = DataProto.from_single_dict(batch_dict)
-                            batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_o', executor=self._executor)
-                            if self.config.azr.train_propose:
-                                batches[f'gen_code_o'] = batch
-                        batch_dict = next(pred_code_o_dataloader)
-                        batch: DataProto = DataProto.from_single_dict(batch_dict)
-                        batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='pred_code_o', executor=self._executor)
-                        batches[f'pred_code_o'] = batch
-
-                    if 'code_e' in self.config.azr.problem_types:
-                        if not self.pretrain_pred:
-                            batch_dict = next(gen_code_e_dataloader)
-                            batch: DataProto = DataProto.from_single_dict(batch_dict)
-                            batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_e', executor=self._executor)
-                            if self.config.azr.train_propose:
-                                batches[f'gen_code_e'] = batch
-                        batch_dict = next(pred_code_e_dataloader)
-                        batch: DataProto = DataProto.from_single_dict(batch_dict)
-                        batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='pred_code_e', executor=self._executor)
-                        batches[f'pred_code_e'] = batch
-
-                    if 'code_f' in self.config.azr.problem_types:
-                        if not self.pretrain_pred:
-                            batch_dict = next(gen_code_f_dataloader)
-                            batch: DataProto = DataProto.from_single_dict(batch_dict)
-                            batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='gen_code_f', executor=self._executor)
-                            if self.config.azr.train_propose:
-                                batches[f'gen_code_f'] = batch
-                        batch_dict = next(pred_code_f_dataloader)
-                        batch: DataProto = DataProto.from_single_dict(batch_dict)
-                        batch, metrics = self._compute_batch(batch, metrics, timing_raw, problem_type='pred_code_f', executor=self._executor)
-                        batches[f'pred_code_f'] = batch
-
-                    # concatenate batches
-                    batch = DataProto.concat(list(batches.values()))
+                    # 1. handle code generation
+                    code_batch_dict = next(code_dataloader)
+                    case_batch_dict = next(case_dataloader)
+                    code_batch: DataProto = DataProto.from_single_dict(code_batch_dict)
+                    case_batch: DataProto = DataProto.from_single_dict(case_batch_dict)
+                    batch, metrics = self._compute_batch(code_batch, case_batch, selected_data, metrics, timing_raw, executor=self._executor)
 
                     PrettyPrinter.section_header(f"Starting Parameter Updates")
                     # update critic
@@ -1699,72 +1346,25 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
 
-                    # validate
-                    PrettyPrinter.section_header(f"Starting Validation")
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
-                        self.global_steps % self.config.trainer.test_freq == 0:
-                        with _timer('testing', timing_raw):
-                            val_metrics: dict = self._validate()
-                            PrettyPrinter.table(
-                                ["Data Source", "Average Score"],
-                                [[k, v] for k, v in val_metrics.items()],
-                                title="Validation Results"
-                            )
-                        metrics.update(val_metrics)
+                    # TODO: validate
+                    # PrettyPrinter.section_header(f"Starting Validation")
+                    # if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
+                    #     self.global_steps % self.config.trainer.test_freq == 0:
+                    #     with _timer('testing', timing_raw):
+                    #         val_metrics: dict = self._validate()
+                    #         PrettyPrinter.table(
+                    #             ["Data Source", "Average Score"],
+                    #             [[k, v] for k, v in val_metrics.items()],
+                    #             title="Validation Results"
+                    #         )
+                    #     metrics.update(val_metrics)
 
-                    # print the statistics of the number of programs in the dataset
-                    if 'code_i' in self.config.azr.problem_types:
-                        PrettyPrinter.status(
-                            "DATA", 
-                            f"Number of programs in the input dataset: {ray.get(self.dataset_manager.get_dataset_size.remote('input'))}", 
-                            "info"
-                        )
-                    if 'code_o' in self.config.azr.problem_types:
-                        PrettyPrinter.status(
-                            "DATA", 
-                            f"Number of programs in the output dataset: {ray.get(self.dataset_manager.get_dataset_size.remote('output'))}", 
-                            "info"
-                        )
-                    if 'code_e' in self.config.azr.problem_types:
-                        PrettyPrinter.status(
-                            "DATA", 
-                            f"Number of programs in the error dataset: {ray.get(self.dataset_manager.get_dataset_size.remote('error'))}", 
-                            "info"
-                        )
-                    if 'code_f' in self.config.azr.problem_types:
-                        PrettyPrinter.status(
-                            "DATA", 
-                            f"Number of programs in the code_f dataset: {ray.get(self.dataset_manager.get_dataset_size.remote('problem'))}", 
-                            "info"
-                        )
+                
                     if self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
 
-                # collect metrics, separate problem types
-                all_types = []
-                if 'code_i' in self.config.azr.problem_types:
-                    if not self.pretrain_pred:
-                        all_types.append('gen_code_i')
-                    all_types.append('pred_code_i')
-                if 'code_o' in self.config.azr.problem_types:
-                    if not self.pretrain_pred:
-                        all_types.append('gen_code_o')
-                    all_types.append('pred_code_o')
-                if 'code_e' in self.config.azr.problem_types:
-                    if not self.pretrain_pred:
-                        all_types.append('gen_code_e')
-                    all_types.append('pred_code_e')
-                if 'code_f' in self.config.azr.problem_types:
-                    if not self.pretrain_pred:
-                        all_types.append('gen_code_f')
-                    all_types.append('pred_code_f')
-                sep_batches = batch.chunk(len(all_types))
-                for sep_batch, problem_type in zip(sep_batches, all_types):
-                    sep_metrics = compute_data_metrics(batch=sep_batch, use_critic=self.use_critic, tokenizer=self.tokenizer)
-                    sep_metrics = {f'{problem_type}/{k}': v for k, v in sep_metrics.items()}
-                    metrics.update(sep_metrics)
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
                 # Get and log type statistics periodically

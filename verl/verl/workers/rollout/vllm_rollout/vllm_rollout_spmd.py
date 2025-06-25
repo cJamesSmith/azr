@@ -175,9 +175,16 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
+        else:
+            self.config.n = prompts.meta_info.get('n', self.config.n)
+            kwargs = {
+                'n': prompts.meta_info.get('n', self.config.n),
+            }
+            # print(f"kwargs: {kwargs}")
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            # print(f"sampling_params: {self.sampling_params}")
             outputs = self.inference_engine.generate(
                 prompts=None,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
