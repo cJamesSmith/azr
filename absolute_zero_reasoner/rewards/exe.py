@@ -13,7 +13,7 @@ from termcolor import cprint
 
 ####### execute the scripts with unit tests #########
 scale_tuple_list = [(4, 4), (16, 16)]
-num_chunks = 4*4*16*2
+num_chunks = 16*16*16*2
 
 def worker(script, input_val, output_queue):
     # Create an iterator over the input lines.

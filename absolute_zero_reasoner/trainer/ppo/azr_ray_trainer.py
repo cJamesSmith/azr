@@ -28,7 +28,7 @@ from verl.trainer.ppo.ray_trainer import (
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProto
 
 from absolute_zero_reasoner.utils.tracking import ReasonRLTracking
-from absolute_zero_reasoner.data_construction.constructor import get_code_case_data, get_case_io_data
+from absolute_zero_reasoner.data_construction.constructor import get_code_case_data
 from absolute_zero_reasoner.trainer.ppo.reason_rl_ray_trainer import ReasonRLRayPPOTrainer
 from absolute_zero_reasoner.utils.dataset.rl_dataset import RLHFDataset
 from absolute_zero_reasoner.rewards.code_reward import parse_code_input_output, parse_inputs_message
@@ -669,44 +669,6 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             sampler=case_sampler
         )), selected_data
 
-    def _create_train_case_dataloader(self, data_len: int) -> DataLoader:
-        io_data = ray.get(self.dataset_manager.get_dataset.remote('seed'))
-        parquet_path = (self._code_dir / f'train_case.parquet').as_posix()
-        os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
-
-        get_case_io_data(
-            io_data=io_data,
-            target_data_len=data_len,
-            content_max_length=self.config.azr.data_selection_strategy.content_max_length,
-            output_path=parquet_path,
-            split='train',
-            tokenizer=self.tokenizer,
-        )
-        code_pred_train_dataset = RLHFDataset(parquet_files=parquet_path,
-                                         tokenizer=self.tokenizer,
-                                         prompt_key=self.config.data.prompt_key,
-                                         max_prompt_length=self.config.data.max_prompt_length,
-                                         filter_prompts=True,
-                                         return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                         truncation='error',
-                                         extra_source_key=f"case_train")
-        # use sampler for better ckpt resume
-        if self.config.data.shuffle:
-            train_dataloader_generator = torch.Generator()
-            train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
-            sampler = RandomSampler(data_source=code_pred_train_dataset, generator=train_dataloader_generator)
-        else:
-            sampler = SequentialSampler(data_source=code_pred_train_dataset)
-
-        code_pred_train_dataloader = DataLoader(dataset=code_pred_train_dataset,
-                                           batch_size=self.config.data.train_batch_size,
-                                           drop_last=True,
-                                           collate_fn=collate_fn,
-                                           sampler=sampler)
-
-        assert len(code_pred_train_dataloader) >= 1
-        return iter(code_pred_train_dataloader)
-
     def _compute_batch(self, code_batch: DataProto, case_batch: DataProto, selected_data, metrics: dict, timing_raw: dict, executor: PythonExecutor) -> tuple[DataProto, dict]:
         PrettyPrinter.section_header(f"Computing batch for code and case")
         # pop those keys for generation
@@ -722,10 +684,13 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             }
 
         # generate a batch
+        # gen_batch: DataProto = DataProto.concat([code_gen_batch, case_gen_batch])
         with _timer(f'gen/code', timing_raw):
+            # gen_batch_output: DataProto = self.actor_rollout_wg.generate_sequences(gen_batch)
             code_gen_batch_output = self.actor_rollout_wg.generate_sequences(code_gen_batch)
         with _timer(f'gen/case', timing_raw):
             case_gen_batch_output = self.actor_rollout_wg.generate_sequences(case_gen_batch)
+        # code_gen_batch_output, case_gen_batch_output = gen_batch_output.chunk(2)
 
         code_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(code_batch.batch))], dtype=object)
         case_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(case_batch.batch))], dtype=object)
@@ -737,8 +702,8 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
         case_batch = case_batch.union(case_gen_batch_output)
 
         # balance the number of valid tokens on each dp rank
-        self._balance_batch(code_batch, metrics=metrics)
-        self._balance_batch(case_batch, metrics=metrics)
+        # self._balance_batch(code_batch, metrics=metrics)
+        # self._balance_batch(case_batch, metrics=metrics)
 
         # compute global_valid tokens
         code_batch.meta_info['global_token_num'] = torch.sum(code_batch.batch['attention_mask'], dim=-1).tolist()
@@ -763,14 +728,14 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                 case_batch = case_batch.union(ref_log_prob_case)
 
         # compute values
-        if self.use_critic:
-            with _timer(f'values/code', timing_raw):
-                values_code = self.critic_wg.compute_values(code_batch)
-                code_batch = code_batch.union(values_code)
+        # if self.use_critic:
+        #     with _timer(f'values/code', timing_raw):
+        #         values_code = self.critic_wg.compute_values(code_batch)
+        #         code_batch = code_batch.union(values_code)
 
-            with _timer(f'values/case', timing_raw):
-                values_case = self.critic_wg.compute_values(case_batch)
-                case_batch = case_batch.union(values_case)
+        #     with _timer(f'values/case', timing_raw):
+        #         values_case = self.critic_wg.compute_values(case_batch)
+        #         case_batch = case_batch.union(values_case)
 
         with _timer(f'adv', timing_raw):
             # if self.use_rm:  # INFO: We do not use reward model (rm) here
@@ -807,8 +772,14 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             else:
                 batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
+            # batch.batch['advantages'] = batch.batch['token_level_scores']
+            # batch.batch['returns'] = batch.batch['token_level_scores']
+            token_level_scores = batch.batch['token_level_scores']
+            idx = torch.where(token_level_scores.sum(-1)!=0)
+            batch = batch[idx]
+
             batch = compute_advantage(batch,
-                                    adv_estimator=self.config.algorithm.adv_estimator,
+                                    adv_estimator='grpo',
                                     gamma=self.config.algorithm.gamma,
                                     lam=self.config.algorithm.lam,
                                     num_repeat=self.config.actor_rollout_ref.rollout.n)
@@ -1247,56 +1218,16 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
         # load checkpoint before doing anything
         self._load_checkpoint()
 
-        # base model chat template
-        if self.config.actor_rollout_ref.model.pretrained_tokenizer:
-            self.tokenizer.chat_template = "{%- for message in messages -%}{{- '\n' if not loop.first -}}{{- message['content'] -}}{%- endfor -%}"
+        # breakpoint()
 
-        breakpoint()
-        
-        # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True) and self.global_steps == 0:
-            PrettyPrinter.section_header(f"Starting Initial Validation")
-            val_metrics = self._validate()
-            PrettyPrinter.table(
-                ["Metric", "Value"],
-                [[k, v] for k, v in val_metrics.items()],
-                title="Initial Validation Metrics"
-            )
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get('val_only', False):
-                return
-
-        if self.loaded_datasets:
-            PrettyPrinter.section_header(f"Resuming training from checkpoint")
-            # print the lengths of the datasets
-            for dataset_name in ['input', 'output', 'error', 'input_steps', 'output_steps', 'error_steps', 'input_steps_counter', 'output_steps_counter', 'error_steps_counter']:
-                PrettyPrinter.status("DATA", f"Length of {dataset_name}: {ray.get(self.dataset_manager.get_dataset_size.remote(dataset_name))}", "info")
-        else:
-            PrettyPrinter.section_header(f"Creating initial seed datasets")
-            # create init dataset
-            need_seed_dataset = any(problem_type != 'code_e' for problem_type in self.config.azr.problem_types) or 'code_f' in self.config.azr.problem_types
-            need_error_dataset = 'code_e' in self.config.azr.problem_types
-            need_code_f_dataset = 'code_f' in self.config.azr.problem_types
-
-            # Initialize with defaults
-            seed_dataset = []
-
-            # Load or generate seed dataset if needed
-            if need_seed_dataset:
-                if self.config.azr.seed_dataset is not None:
-                    PrettyPrinter.status("DATA", "Loading seed dataset from file...", "info")
-                    with open(self.config.azr.seed_dataset, 'r') as file:
-                        # seed_dataset = [json.loads(line) for line in file]  # for *.jsonl file
-                        seed_dataset = json.load(file)  # for *.json file
-                    PrettyPrinter.status("DATA", f"Loaded {len(seed_dataset)} seed entries", "success")
-                    ray.get(self.dataset_manager.update_seed.remote(seed_dataset))
+        PrettyPrinter.status("DATA", "Loading training dataset from file...", "info")
+        with open(self.config.azr.seed_dataset, 'r') as file:
+            seed_dataset = json.load(file)  # for *.json file
+        PrettyPrinter.status("DATA", f"Loaded {len(seed_dataset)} seed entries", "success")
+        ray.get(self.dataset_manager.update_seed.remote(seed_dataset))
 
         # we start from step 1
         self.global_steps += 1
-        if self.config.azr.pretrain_pred_steps > 0 and self.global_steps <= self.config.azr.pretrain_pred_steps:
-            self.pretrain_pred = True
-        else:
-            self.pretrain_pred = False
 
         while self.global_steps < self.total_training_steps:
             PrettyPrinter.section_header(f"Training Step {self.global_steps}")
@@ -1310,12 +1241,13 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
             )
 
             data_len = self.config.data.train_batch_size * self.config.azr.data_selection_strategy.update_iteration
+            data_len = data_len * 2 - 1
             code_dataloader, case_dataloader, selected_data = self._create_train_code_case_dataloader(data_len=data_len)
+            print(f"Data length: {data_len}, Code Dataloader: {len(code_dataloader)}, Case Dataloader: {len(case_dataloader)}")
 
             for _ in range(self.config.azr.data_selection_strategy.update_iteration):
                 metrics = {}
                 timing_raw = {}
-                batches = {}
                 with _timer('step', timing_raw):
                     # Clean up executor periodically
                     if self.global_steps - self._last_cleanup_step >= self._cleanup_frequency:
@@ -1330,7 +1262,9 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                     code_batch: DataProto = DataProto.from_single_dict(code_batch_dict)
                     case_batch: DataProto = DataProto.from_single_dict(case_batch_dict)
                     batch, metrics = self._compute_batch(code_batch, case_batch, selected_data, metrics, timing_raw, executor=self._executor)
-
+                    batch = DataProto(batch=batch.batch,
+                                     non_tensor_batch=batch.non_tensor_batch,
+                                     meta_info=batch.meta_info)
                     PrettyPrinter.section_header(f"Starting Parameter Updates")
                     # update critic
                     if self.use_critic:
@@ -1418,9 +1352,6 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                 )
 
                 logger.log(data=metrics, step=self.global_steps)
-
-                if self.global_steps >= self.config.azr.pretrain_pred_steps:
-                    self.pretrain_pred = False
 
                 self.global_steps += 1
 
